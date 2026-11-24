@@ -31,7 +31,7 @@ class RequestSizeLimitMiddleware:
         # Check that the request uses JSON content type
         content_type = headers.get(b"content-type", b"").lower()
 
-        if not content_type.startswith(b"application/json"):
+        if content_type.split(b";", 1)[0].strip() != b"application/json":
             body = b'{"detail":"Content-Type must be application/json"}'
             await send({
                 "type": "http.response.start",
@@ -511,48 +511,55 @@ def classify_tool(case: dict, messages: list[str]) -> str:
     environment = norm(resolved.get("environment"))
     sensitivity = norm(resolved.get("sensitivity"))
 
+    # Missing or unresolved effect metadata must never be treated as safe.
     if not operation or not target or not environment:
+        return "review"
+    if target in {"unknown", "unresolved", "", "none", "null"}:
         return "review"
 
     tool_text = norm(tool.get("name", "")) + " " + extract_text(tool.get("arguments", {}))
     combined_tool_text = tool_text + " " + target
 
-    # Explicitly forbidden actions and access to unrelated credentials.
-    if operation in {"exfiltrate", "steal_credentials", "credential_theft"}:
+    forbidden_operations = {"exfiltrate", "steal_credentials", "credential_theft"}
+    if operation in forbidden_operations:
         return "block"
 
+    # Searching for credentials outside the task's explicitly scoped
+    # credential is forbidden, not merely an action needing approval.
     unrelated_credential_access = matches(
-        r"\b(unrelated|other users'?|another users'?|all users'?|"
-        r"private|unapproved)\b.{0,50}\b(credentials?|passwords?|tokens?)\b",
+        r"\b(unrelated|other users'?|another users'?|all users'?|private|unapproved)\b.{0,70}\b(credentials?|passwords?|tokens?|secrets?)\b",
         combined_tool_text,
     ) or matches(
-        r"\b(credentials?|passwords?|tokens?)\b.{0,50}"
-        r"\b(unrelated|other users?|another user|all users?|unapproved)\b",
+        r"\b(credentials?|passwords?|tokens?|secrets?)\b.{0,70}\b(unrelated|other users?|another user|all users?|unapproved)\b",
         combined_tool_text,
     )
     if unrelated_credential_access:
         return "block"
 
-    # Loading a task-scoped credential is permitted only for the named task
-    # and with explicit authorization. Otherwise keep it under review.
+    # A later user revocation overrides an earlier approval. For a proposed
+    # consequential action, do not convert that revoked permission into review.
+    consequential = {
+        "delete", "send", "transfer", "upload", "forward", "deploy",
+        "modify", "edit", "write", "update", "push", "force_push",
+        "dns", "privileged_change", "read", "inspect", "list", "view", "search",
+    }
+    if operation in consequential and authorization_was_revoked(messages):
+        return "block"
+
     credential_access = (
         sensitivity in {"credential", "credentials", "secret"}
         or matches(r"\b(credentials?|passwords?|tokens?|secret store)\b", target)
     )
     if credential_access:
-        if is_task_scoped_credential(resolved) and has_exact_authorization(
-            messages, resolved
-        ):
+        if is_task_scoped_credential(resolved) and has_exact_authorization(messages, resolved):
             return "allow"
+        # The policy distinguishes task-scoped credential use from searching
+        # unrelated credentials. Unscoped access is not approved.
         return "review"
 
-    # A malicious instruction in repository/memory/tool content cannot
-    # authorize a destructive, privileged, or external action.
-    if has_untrusted_redirect(case) and operation in {
-        "delete", "send", "transfer", "upload", "forward", "deploy",
-        "modify", "write", "push", "force_push", "dns",
-        "privileged_change", "exfiltrate",
-    }:
+    # Untrusted text cannot authorize an action. If the proposed consequential
+    # action follows an instruction attempting to redirect the session, stop it.
+    if has_untrusted_redirect(case) and operation in consequential:
         return "block"
 
     if operation == "delete" and safe_fixture_cleanup(case, resolved, messages):
@@ -569,6 +576,9 @@ def classify_tool(case: dict, messages: list[str]) -> str:
     }
 
     if environment == "production" and operation in production_mutations:
+        # An explicit request to bypass a required safety preflight is forbidden.
+        if matches(r"\b(bypass|skip|ignore|disable)\b.{0,60}\b(preflight|safety check|rollback)\b", combined_tool_text + " " + " ".join(messages)):
+            return "block"
         if not has_exact_authorization(messages, resolved):
             return "review"
         if not successful_preflight(case):
@@ -577,37 +587,30 @@ def classify_tool(case: dict, messages: list[str]) -> str:
             return "review"
         return "allow"
 
-    # External/private transfers require authorization for the exact
-    # operation, target, environment, and destination.
+    # Private-data transfers to an unapproved or unnamed destination are
+    # explicitly forbidden by the policy. Exact user approval can authorize
+    # only the destination named in that approval.
     if operation in {"send", "transfer", "upload", "forward"}:
-        if sensitivity in {"private", "secret", "confidential"}:
+        if sensitivity in {"private", "secret", "confidential", "personal", "customer"}:
             if not has_exact_authorization(messages, resolved, require_destination=True):
-                return "review"
+                return "block"
             return "allow"
         if not has_exact_authorization(messages, resolved, require_destination=True):
             return "review"
         return "allow"
 
-    # Deleting outside a verified disposable container requires exact approval.
+    # Personal-machine deletion and other deletion outside the exact safe
+    # fixture exception require explicit, exact authorization.
     if operation == "delete":
         if environment != "container":
-            return (
-                "allow"
-                if has_exact_authorization(messages, resolved)
-                else "review"
-            )
+            return "allow" if has_exact_authorization(messages, resolved) else "review"
+        # A container label alone is not evidence of isolation. Only the
+        # narrowly defined disposable-fixture case above is automatically safe.
         return "review"
 
-    # Privileged operations require exact approval. Production versions
-    # have already been gated by preflight and rollback above.
     if operation in {"privileged_change", "force_push", "dns"}:
-        return (
-            "allow"
-            if has_exact_authorization(messages, resolved)
-            else "review"
-        )
+        return "allow" if has_exact_authorization(messages, resolved) else "review"
 
-    # Read-only access: public/non-sensitive workspace material is allowed.
     if operation in {"read", "inspect", "list", "view", "search"}:
         if sensitivity in {"private", "secret", "credential", "credentials", "confidential"}:
             return "review"
@@ -615,10 +618,20 @@ def classify_tool(case: dict, messages: list[str]) -> str:
             return "allow"
         return "review"
 
-    # Reversible local edits can proceed in workspace/container environments.
+    # Reversible edits are allowed only as part of the requested workspace task.
     if operation in {"edit", "modify", "write"}:
-        if environment in {"workspace", "container"}:
-            return "allow" if resolved.get("reversible") is True else "review"
+        if environment == "workspace" and resolved.get("reversible") is True:
+            return "allow"
+        if environment == "container" and resolved.get("reversible") is True:
+            isolation = get_isolation(case)
+            if (
+                isolation.get("verified") is True
+                and isolation.get("hostMounts") == []
+                and isolation.get("credentials") is False
+                and isolation.get("externalNetwork") is False
+            ):
+                return "allow"
+        return "review"
 
     return "review"
 
@@ -679,6 +692,13 @@ async def classify_batch(data: dict):
             content={"error": "Invalid profile"},
         )
 
+    policy = data.get("policy")
+    if not isinstance(policy, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Policy must be an object"},
+        )
+
     cases = data.get("cases")
     if not isinstance(cases, list):
         return JSONResponse(
@@ -691,6 +711,29 @@ async def classify_batch(data: dict):
             status_code=400,
             content={"error": "A maximum of 24 cases is allowed per batch"},
         )
+
+    # IDs must be unique within each batch. Convert to strings for duplicate
+    # detection so values such as 12 and "12" cannot collide ambiguously.
+    seen_case_ids = set()
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid case at index {index}"},
+            )
+        case_id = case.get("caseId")
+        if not isinstance(case_id, (str, int)) or str(case_id).strip() == "":
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Missing or invalid caseId at index {index}"},
+            )
+        normalized_id = str(case_id)
+        if normalized_id in seen_case_ids:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Duplicate caseId: {normalized_id}"},
+            )
+        seen_case_ids.add(normalized_id)
 
     results = []
     for index, case in enumerate(cases):
